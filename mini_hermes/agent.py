@@ -1,11 +1,12 @@
 """
-Mini-Hermes agent with layered memory.
+Mini-Hermes agent with layered memory and skills.
 
 Architecture:
   - Curated persistent memory: ~/.mini-hermes/memories/{MEMORY,USER}.md
   - Episodic session archive:  ~/.mini-hermes/state.db (FTS5)
+  - Procedural memory (skills): ~/.mini-hermes/skills/
   - Context compression:       head + structured summary + tail
-  - Tools: memory, session_search
+  - Tools: memory, session_search, skills_list, skill_view, skill_manage, delegate_task, read_file, write_file, search_files, patch, execute_code
 """
 
 from __future__ import annotations
@@ -14,25 +15,66 @@ import json
 import os
 import sys
 from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from context_compressor import ContextCompressor, estimate_tokens
-from memory_store import MemoryStore
-from memory_tool import MemoryTool
-from session_search import SessionSearchTool
-from session_store import SessionStore
+from mini_hermes.context import ContextCompressor, estimate_tokens
+from mini_hermes.delegation import DelegationManager, SubagentTool
+from mini_hermes.learn import build_learn_prompt, is_learn_command
+from mini_hermes.memory import MemoryStore, MemoryTool
+from mini_hermes.sessions import SessionSearchTool, SessionStore
+from mini_hermes.skills import SkillManagerTool, SkillStore, SkillsTool
+from mini_hermes.tools import WorkspaceTools
 
 
-SYSTEM_PROMPT_TEMPLATE = """You are a helpful coding assistant with persistent memory.
+SYSTEM_PROMPT_TEMPLATE = """You are a helpful coding assistant with persistent memory, reusable skills, and subagents.
 
 {memory_section}
 
 {user_section}
 
-You have access to tools. Use them when needed. When you learn durable facts about the user or environment, call the `memory` tool. When the user refers to past conversations, call `session_search`.
+## AVAILABLE SKILLS (compact index)
+Load a skill with skill_view(name) when relevant. Supporting files can be loaded with skill_view(name, file_path).
+
+{skills_index}
+
+## WORKFLOW RULES — FOLLOW STRICTLY
+1. You DO have file-write tools. NEVER claim otherwise. Use write_file to create files and patch to edit them.
+2. When the user asks for code, functions, scripts, tests, or project changes, you MUST create or modify files in the current workspace. NEVER return code only in chat. NEVER ask the user to "drop it into a folder" — you are the one who writes files.
+3. For coding tasks, first delegate to the `coder` subagent via delegate_task(expertise="coder", task=...). Give it the full task and context. The coder subagent will write files and run tests.
+4. After the coder subagent returns, verify the files exist by reading them, then summarize what was created for the user.
+5. For research before coding, use the `researcher` subagent via delegate_task(expertise="researcher", task=...).
+6. For code review, use the `reviewer` subagent via delegate_task(expertise="reviewer", task=...).
+7. For planning complex multi-step work, use the `planner` subagent via delegate_task(expertise="planner", task=...).
+8. For turning a successful workflow into a reusable skill, use the `skill-author` subagent via delegate_task(expertise="skill-author", task=...).
+9. When you learn durable facts about the user or environment, call the `memory` tool.
+10. When the user refers to past conversations, call `session_search`.
+11. When a reusable procedure applies, call `skills_list` / `skill_view` / `skill_manage`.
+
+## FEW-SHOT EXAMPLES
+
+### Example 1: User asks for code
+User: "Write a function to validate email addresses."
+Correct response: call delegate_task(expertise="coder", task="Write a Python function to validate email addresses using regex. Save it as email_utils.py in the current workspace and create pytest tests in test_email_utils.py. Run the tests and report results.")
+Incorrect response: returning code in chat.
+
+### Example 2: User asks for a script
+User: "Create a script that downloads a file from a URL."
+Correct response: call delegate_task(expertise="coder", task="Create a Python script download_file.py that downloads a file from a given URL. Include argparse, error handling, and a small test.")
+Incorrect response: showing the script in chat.
+
+### Example 3: User asks for tests
+User: "Add tests for the email validator."
+Correct response: call delegate_task(expertise="coder", task="Add pytest tests for email_utils.py in test_email_utils.py. Cover valid and invalid cases. Run pytest and report results.")
+Incorrect response: listing test cases in chat.
+
+### Example 4: User asks for a project change
+User: "Refactor main.py to use a class."
+Correct response: call delegate_task(expertise="coder", task="Refactor main.py to use a class-based structure. Preserve existing behavior. Run the script to verify it still works.")
+Incorrect response: describing the refactor in chat.
 
 Current date: {current_date}
 """
@@ -65,8 +107,22 @@ class Agent:
 
         self.memory_store = MemoryStore()
         self.session_store = SessionStore()
+        self.skill_store = SkillStore(project_dir=Path.cwd())
+        # Use a dedicated workspace subfolder so generated files don't pollute the agent source.
+        self.workspace_dir = Path.cwd() / "workspace"
+        self.workspace_dir.mkdir(exist_ok=True)
+        self.workspace_tools = WorkspaceTools(str(self.workspace_dir))
         self.memory_tool = MemoryTool(self.memory_store)
         self.session_search_tool = SessionSearchTool(self.session_store)
+        self.skills_tool = SkillsTool(self.skill_store)
+        self.skill_manager_tool = SkillManagerTool(self.skill_store)
+        self.delegation_manager = DelegationManager(
+            self.client,
+            self.model,
+            tool_schemas_provider=self._get_child_tool_schemas,
+            tool_executor_provider=self._get_child_tool_executor,
+        )
+        self.subagent_tool = SubagentTool(self.delegation_manager)
         self.compressor = ContextCompressor(
             self.client,
             self.model,
@@ -94,10 +150,12 @@ class Agent:
             if user_text.strip()
             else "## USER PROFILE\n(none yet)"
         )
+        skills_index = self.skill_store.get_index_text()
 
         system_content = SYSTEM_PROMPT_TEMPLATE.format(
             memory_section=memory_section,
             user_section=user_section,
+            skills_index=skills_index,
             current_date=date.today().isoformat(),
         )
         self.messages.append({"role": "system", "content": system_content})
@@ -108,7 +166,7 @@ class Agent:
     def run_interactive(self) -> None:
         self.start_session()
         print(f"Using Fireworks model: {self.model}")
-        print("Type your question (or 'exit' to quit).\n")
+        print("Type your question, /learn <source>, or 'exit' to quit.\n")
 
         while True:
             user_input = input("You: ").strip()
@@ -118,15 +176,29 @@ class Agent:
             if not user_input:
                 continue
 
+            is_learn, learn_source = is_learn_command(user_input)
+            if is_learn:
+                self._enter_learn_mode(learn_source)
+                continue
+
             self._add_message("user", user_input)
             self._maybe_compress()
             self._respond()
+
+    def _enter_learn_mode(self, source: Optional[str]) -> None:
+        if not source:
+            print("Usage: /learn <source or experience description>\n")
+            return
+        prompt = build_learn_prompt(source)
+        self._add_message("user", prompt)
+        print("[entering /learn mode]\n")
+        self._respond()
 
     # ------------------------------------------------------------------
     # Response handling with tool support
     # ------------------------------------------------------------------
     def _respond(self) -> None:
-        tools = [self.memory_tool.schema(), self.session_search_tool.schema()]
+        tools = self._get_tool_schemas()
 
         try:
             response = self.client.chat.completions.create(
@@ -191,6 +263,40 @@ class Agent:
         # Recurse to get final answer after tool results.
         self._respond()
 
+    def _get_tool_schemas(self) -> List[dict]:
+        return [
+            self.memory_tool.schema(),
+            self.session_search_tool.schema(),
+            self.skills_tool.list_schema(),
+            self.skills_tool.view_schema(),
+            self.skill_manager_tool.schema(),
+            self.subagent_tool.schema(),
+            *self.workspace_tools.schemas(),
+        ]
+
+    def _get_child_tool_schemas(self, depth: int) -> List[dict]:
+        """Tools available to a child subagent. Leaf children cannot delegate further."""
+        schemas = [
+            self.memory_tool.schema(),
+            self.session_search_tool.schema(),
+            self.skills_tool.list_schema(),
+            self.skills_tool.view_schema(),
+            self.skill_manager_tool.schema(),
+            *self.workspace_tools.schemas(),
+        ]
+        # Only non-leaf subagents can delegate.
+        if depth < 1:
+            schemas.append(self.subagent_tool.schema())
+        return schemas
+
+    def _get_child_tool_executor(self, depth: int):
+        """Return a tool executor bound to the given subagent depth."""
+        def executor(name: str, arguments_json: str) -> dict:
+            if name == "delegate_task" and depth >= 1:
+                return {"ok": False, "error": "leaf subagent cannot delegate further"}
+            return self._execute_tool(name, arguments_json)
+        return executor
+
     def _execute_tool(self, name: str, arguments_json: str) -> dict:
         try:
             arguments = json.loads(arguments_json)
@@ -201,6 +307,16 @@ class Agent:
             return self.memory_tool.run(arguments)
         if name == "session_search":
             return self.session_search_tool.run(arguments)
+        if name == "skills_list":
+            return self.skills_tool.list()
+        if name == "skill_view":
+            return self.skills_tool.view(arguments.get("name"), arguments.get("file_path"))
+        if name == "skill_manage":
+            return self.skill_manager_tool.run(arguments)
+        if name == "delegate_task":
+            return self.subagent_tool.run(arguments)
+        if name in ("read_file", "write_file", "search_files", "patch", "execute_code"):
+            return self.workspace_tools.execute(name, arguments)
         return {"ok": False, "error": f"unknown tool: {name}"}
 
     # ------------------------------------------------------------------

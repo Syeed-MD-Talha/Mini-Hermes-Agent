@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from memory_store import MemoryStore
+from .store import MemoryStore
 
 
 MEMORY_TOOL_SCHEMA = {

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from session_store import SessionStore
+from .store import SessionStore
 
 
 class SessionSearchTool:

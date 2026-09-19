@@ -42,4 +42,9 @@ Thumbs.db
 
 # Project-specific: local Hermes state lives in the home directory, but ignore
 # any accidental copies in the workspace.
+
+# Local agent state (skills, memory, sessions) — do not commit personal state.
 .mini-hermes/
+
+# Generated user workspace
+workspace/
