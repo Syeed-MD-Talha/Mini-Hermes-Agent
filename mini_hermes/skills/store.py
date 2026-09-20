@@ -60,7 +60,7 @@ class SkillStore:
         project_dir: Optional[Path] = None,
     ) -> None:
         self.global_dir = (base_dir or Path.home() / ".mini-hermes") / SKILL_DIR_NAME
-        self.project_dir = (project_dir or Path.cwd() / ".mini-hermes") / SKILL_DIR_NAME
+        self.project_dir = ((project_dir or Path.cwd()) / ".mini-hermes") / SKILL_DIR_NAME
 
         # Ensure directories exist.
         self.global_dir.mkdir(parents=True, exist_ok=True)

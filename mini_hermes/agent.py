@@ -27,7 +27,7 @@ from mini_hermes.learn import build_learn_prompt, is_learn_command
 from mini_hermes.memory import MemoryStore, MemoryTool
 from mini_hermes.sessions import SessionSearchTool, SessionStore
 from mini_hermes.skills import SkillManagerTool, SkillStore, SkillsTool
-from mini_hermes.tools import WorkspaceTools
+from mini_hermes.tools import WebTools, WorkspaceTools
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are a helpful coding assistant with persistent memory, reusable skills, and subagents.
@@ -53,6 +53,11 @@ Load a skill with skill_view(name) when relevant. Supporting files can be loaded
 9. When you learn durable facts about the user or environment, call the `memory` tool.
 10. When the user refers to past conversations, call `session_search`.
 11. When a reusable procedure applies, call `skills_list` / `skill_view` / `skill_manage`.
+12. **AUTO-SKILL CREATION**: If no existing skill matches the user's task, or if the task would benefit from a reusable procedure, first use `skill_manage(action="create", ...)` to author a skill, then execute it. Treat skill creation as a normal tool step, not a separate mode.
+13. For creating a new skill, delegate to the `skill-author` subagent via `delegate_task(expertise="skill-author", task=...)`. The skill-author will write a complete SKILL.md with examples and constraints.
+14. **WEB SEARCH**: For current events, weather, news, sports scores, stock prices, or any time-sensitive facts, you MUST use `web_search`. Do not rely on training data. After searching, use `web_fetch` on the most promising result to verify details before answering.
+15. **TIME QUESTIONS**: For "what time is it" or any timezone/time question, use `get_time(timezone=...)`. Do NOT use web search for time. Common timezones: UTC, Asia/Dhaka, America/New_York, Europe/London.
+16. **HONESTY ABOUT DATA FRESHNESS**: Always report when the data was published or observed. If you cannot find current data, say so instead of guessing. Never invent exact numbers, times, or conditions.
 
 ## FEW-SHOT EXAMPLES
 
@@ -75,6 +80,14 @@ Incorrect response: listing test cases in chat.
 User: "Refactor main.py to use a class."
 Correct response: call delegate_task(expertise="coder", task="Refactor main.py to use a class-based structure. Preserve existing behavior. Run the script to verify it still works.")
 Incorrect response: describing the refactor in chat.
+
+### Example 5: User asks for something with no matching skill
+User: "Create a PowerPoint presentation about Rust String vs &str."
+Correct response:
+1. call skills_list to check for a pptx skill.
+2. If none exists, call delegate_task(expertise="skill-author", task="Create a skill named 'create-pptx' in category 'productivity' that teaches how to build PowerPoint decks with python-pptx. Include a complete runnable example and constraints.")
+3. Then call delegate_task(expertise="coder", task="Use the create-pptx skill to create a PowerPoint about Rust String vs &str. Save it as Rust_String_vs_str.pptx in the workspace.")
+Incorrect response: returning a truncated script in chat or claiming you cannot create files.
 
 Current date: {current_date}
 """
@@ -112,6 +125,7 @@ class Agent:
         self.workspace_dir = Path.cwd() / "workspace"
         self.workspace_dir.mkdir(exist_ok=True)
         self.workspace_tools = WorkspaceTools(str(self.workspace_dir))
+        self.web_tools = WebTools()
         self.memory_tool = MemoryTool(self.memory_store)
         self.session_search_tool = SessionSearchTool(self.session_store)
         self.skills_tool = SkillsTool(self.skill_store)
@@ -122,7 +136,7 @@ class Agent:
             tool_schemas_provider=self._get_child_tool_schemas,
             tool_executor_provider=self._get_child_tool_executor,
         )
-        self.subagent_tool = SubagentTool(self.delegation_manager)
+        self.subagent_tool = SubagentTool(self.delegation_manager, default_workspace=str(self.workspace_dir))
         self.compressor = ContextCompressor(
             self.client,
             self.model,
@@ -201,52 +215,87 @@ class Agent:
         tools = self._get_tool_schemas()
 
         try:
-            response = self.client.chat.completions.create(
+            stream = self.client.chat.completions.create(
                 model=self.model,
-                max_tokens=2048,
+                max_tokens=4096,
                 messages=self.messages,
                 tools=tools,
                 tool_choice="auto",
+                stream=True,
             )
         except Exception as e:
             print(f"\nError: {e}\n")
             return
 
-        choice = response.choices[0]
-        message = choice.message
-
-        # Record assistant message (with tool calls if any).
+        # Stream the response, collecting content and tool calls.
         assistant_msg: Dict[str, Any] = {"role": "assistant"}
-        if message.content:
-            assistant_msg["content"] = message.content
-        if message.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": tc.type,
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in message.tool_calls
-            ]
-        self.messages.append(assistant_msg)
-        self._persist_message("assistant", message.content, tool_calls=assistant_msg.get("tool_calls"))
+        content_parts: List[str] = []
+        tool_calls: Dict[int, Dict[str, Any]] = {}
+        printed_any = False
 
-        if not message.tool_calls:
-            print(f"\nAssistant: {message.content or '(no content)'}\n")
+        print("\nAssistant: ", end="", flush=True)
+        for chunk in stream:
+            if not chunk.choices:
+                # Some providers emit empty heartbeat/finish chunks.
+                continue
+            delta = chunk.choices[0].delta
+
+            # Stream text content, suppressing leading blank lines.
+            if delta.content:
+                text = delta.content
+                if not printed_any:
+                    text = text.lstrip("\n")
+                    if text:
+                        printed_any = True
+                else:
+                    printed_any = True
+                if printed_any:
+                    print(text, end="", flush=True)
+                    content_parts.append(delta.content)
+
+            # Accumulate tool calls (not streamed character-by-character).
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {
+                            "id": tc.id or "",
+                            "type": tc.type or "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    if tc.id:
+                        tool_calls[idx]["id"] = tc.id
+                    if tc.type:
+                        tool_calls[idx]["type"] = tc.type
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls[idx]["function"]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_calls[idx]["function"]["arguments"] += tc.function.arguments
+
+        print("\n")
+
+        content = "".join(content_parts)
+        if content:
+            assistant_msg["content"] = content
+        if tool_calls:
+            assistant_msg["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+
+        self.messages.append(assistant_msg)
+        self._persist_message("assistant", content, tool_calls=assistant_msg.get("tool_calls"))
+
+        if not tool_calls:
             return
 
         # Execute tools and continue the loop.
         tool_results: List[Dict[str, Any]] = []
-        for tc in message.tool_calls:
-            result = self._execute_tool(tc.function.name, tc.function.arguments)
+        for tc in assistant_msg["tool_calls"]:
+            result = self._execute_tool(tc["function"]["name"], tc["function"]["arguments"])
             tool_results.append(
                 {
                     "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": tc.function.name,
+                    "tool_call_id": tc["id"],
+                    "name": tc["function"]["name"],
                     "content": json.dumps(result, ensure_ascii=False),
                 }
             )
@@ -271,6 +320,7 @@ class Agent:
             self.skills_tool.view_schema(),
             self.skill_manager_tool.schema(),
             self.subagent_tool.schema(),
+            *self.web_tools.schemas(),
             *self.workspace_tools.schemas(),
         ]
 
@@ -282,6 +332,7 @@ class Agent:
             self.skills_tool.list_schema(),
             self.skills_tool.view_schema(),
             self.skill_manager_tool.schema(),
+            *self.web_tools.schemas(),
             *self.workspace_tools.schemas(),
         ]
         # Only non-leaf subagents can delegate.
@@ -315,7 +366,9 @@ class Agent:
             return self.skill_manager_tool.run(arguments)
         if name == "delegate_task":
             return self.subagent_tool.run(arguments)
-        if name in ("read_file", "write_file", "search_files", "patch", "execute_code"):
+        if name in ("web_search", "web_fetch"):
+            return self.web_tools.execute(name, arguments)
+        if name in ("read_file", "write_file", "search_files", "patch", "execute_code", "get_time"):
             return self.workspace_tools.execute(name, arguments)
         return {"ok": False, "error": f"unknown tool: {name}"}
 

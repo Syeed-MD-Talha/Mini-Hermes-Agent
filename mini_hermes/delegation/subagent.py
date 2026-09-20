@@ -7,6 +7,7 @@ isolation with restricted tools and returns a structured result.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -16,8 +17,9 @@ if TYPE_CHECKING:
 class SubagentTool:
     """Tool that delegates work to an isolated child agent."""
 
-    def __init__(self, manager: "DelegationManager") -> None:
+    def __init__(self, manager: "DelegationManager", default_workspace: str = ".") -> None:
         self.manager = manager
+        self.default_workspace = str(Path(default_workspace).resolve())
 
     def schema(self) -> dict:
         return {
@@ -59,7 +61,7 @@ class SubagentTool:
                         },
                         "workspace": {
                             "type": "string",
-                            "description": "Working directory for the subagent.",
+                            "description": "Working directory for the subagent. Defaults to the parent's workspace.",
                         },
                     },
                     "required": ["expertise", "task"],
@@ -74,7 +76,7 @@ class SubagentTool:
         relevant_memory = arguments.get("relevant_memory", "")
         relevant_skills = arguments.get("relevant_skills", "")
         constraints = arguments.get("constraints", "")
-        workspace = arguments.get("workspace", ".")
+        workspace = arguments.get("workspace") or self.default_workspace
 
         if not task:
             return {"ok": False, "error": "task is required"}

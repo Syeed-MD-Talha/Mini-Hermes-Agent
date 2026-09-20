@@ -75,8 +75,16 @@ RULES:
 - Work autonomously. Do not ask the user questions.
 - Use the provided tools to complete the task.
 - When finished, return a concise final summary of what you did and what the result is.
-- If you changed files, list them.
-- Do not delegate to other subagents unless explicitly instructed.
+- If you changed files, list them with their RELATIVE paths under the workspace above.
+- Do NOT delegate to other subagents unless explicitly instructed.
+- You can ONLY read/write files inside the workspace path shown above. Absolute paths outside it will be rejected.
+
+SKILL-AUTHOR SPECIALIZATION:
+If your expertise is "skill-author", your goal is to create a reusable SKILL.md file.
+- Use skill_manage(action="create", name=..., category=..., description=..., content=...) to write the skill.
+- The SKILL.md must include: title, description, when-to-use, step-by-step instructions, complete runnable example, common pitfalls, and constraints.
+- Keep the skill focused and practical (not a generic tutorial).
+- After creating the skill, return its name and a one-line summary.
 """
 
 
@@ -113,11 +121,11 @@ class ChildAgent:
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
-                    max_tokens=2048,
+                    max_tokens=4096,
                     messages=self.messages,
                     tools=self.tool_schemas,
                     tool_choice="auto",
-                    timeout=30,
+                    timeout=120,
                 )
             except Exception as e:
                 return self._build_result("failed", f"api_error: {e}", turn, time.time() - start)
