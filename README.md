@@ -1,6 +1,6 @@
 # Mini-Hermes Agent
 
-A small, educational implementation of a [Hermes](https://github.com/reworkd/AgentGPT/tree/main?ref=blog.reworkd.ai)-style autonomous agent. The goal of this project is to make the core ideas behind large agent frameworks easier to understand by building a minimal but working version from scratch.
+A small, educational implementation of a [Hermes](https://github.com/nousresearch/hermes-agent)-style autonomous agent. The goal of this project is to make the core ideas behind large agent frameworks easier to understand by building a minimal but working version from scratch.
 
 > **Status:** Work in progress. Features are being added incrementally.
 
